@@ -6,50 +6,38 @@ const forge   = require('node-forge');
 const app = express();
 
 // ============================================================
-// CORS — DEBE IR ANTES QUE CUALQUIER RUTA
+// CORS
 // ============================================================
 const ALLOWED_ORIGINS = [
     'https://astralchk.com',
     'https://www.astralchk.com',
     'http://localhost:3000',
     'http://127.0.0.1:5500',
-    'http://localhost:5500',
-    'https://p01--extrapolador--jbrg9jvfl7cz.code.run'
+    'http://localhost:5500'
 ];
 
 app.use((req, res, next) => {
     const origin = req.headers.origin;
-
     if (origin && ALLOWED_ORIGINS.includes(origin)) {
         res.setHeader('Access-Control-Allow-Origin', origin);
         res.setHeader('Vary', 'Origin');
     } else if (!origin) {
-        // peticiones sin origin (curl, server-to-server) — permitir
         res.setHeader('Access-Control-Allow-Origin', '*');
     } else {
-        // origin no listado → igual respondemos con su origin para no romper dev
-        // En producción estricta: quita este else o devuelve 403.
         res.setHeader('Access-Control-Allow-Origin', origin);
         res.setHeader('Vary', 'Origin');
     }
-
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-API-Key, Authorization');
     res.setHeader('Access-Control-Allow-Credentials', 'true');
-    res.setHeader('Access-Control-Max-Age', '86400'); // cache preflight 24h
-
-    // Responder preflight inmediatamente
-    if (req.method === 'OPTIONS') {
-        return res.status(204).end();
-    }
-
+    if (req.method === 'OPTIONS') return res.status(204).end();
     next();
 });
 
 app.use(express.json({ limit: '256kb' }));
 
 // ============================================================
-// ENV / CONFIG
+// CONFIG
 // ============================================================
 const PORT         = process.env.PORT       || 3000;
 const API_KEY      = process.env.CVV_API_KEY || null;
@@ -57,24 +45,13 @@ const DEFAULT_CVKA = process.env.CVK_A       || null;
 const DEFAULT_CVKB = process.env.CVK_B       || null;
 
 // ============================================================
-// CRYPTO (DES / 3DES / decimalize)
+// CRYPTO (DES CORREGIDO)
 // ============================================================
 function desEncryptBlock(keyHex, dataHex) {
     const cipher = forge.cipher.createCipher('DES-ECB', forge.util.hexToBytes(keyHex));
     cipher.start();
     cipher.update(forge.util.createBuffer(forge.util.hexToBytes(dataHex)));
     if (!cipher.finish()) throw new Error('DES encryption failed');
-    return cipher.output.toHex().toUpperCase();
-}
-
-function tripleDesEncryptBlock(keyHex, dataHex) {
-    let key = keyHex.toUpperCase();
-    if (key.length === 32) key = key + key.slice(0, 16); // 2-key → 3-key
-    if (key.length !== 48) throw new Error('3DES key must be 16 or 24 bytes');
-    const cipher = forge.cipher.createCipher('3DES-ECB', forge.util.hexToBytes(key));
-    cipher.start();
-    cipher.update(forge.util.createBuffer(forge.util.hexToBytes(dataHex)));
-    if (!cipher.finish()) throw new Error('3DES encryption failed');
     return cipher.output.toHex().toUpperCase();
 }
 
@@ -110,9 +87,11 @@ function calculateCvv({ pan, expdate, serviceCode, cvka, cvkb }) {
     if (!/^[0-9A-F]{16}$/.test(cvkaU)) throw new Error('CVKA must be 16 hex chars');
     if (!/^[0-9A-F]{16}$/.test(cvkbU)) throw new Error('CVKB must be 16 hex chars');
 
+    // ALGORITMO ESTÁNDAR (DES)
     const step1 = desEncryptBlock(cvkaU, panNorm);
     const step2 = hexXor(step1, dataBlock);
-    const step3 = tripleDesEncryptBlock(cvkaU + cvkbU, step2);
+    const step3 = desEncryptBlock(cvkbU, step2); // <--- AQUÍ ESTABA EL ERROR (usaba 3DES)
+    
     return decimalize(step3).slice(0, 3);
 }
 
@@ -129,74 +108,11 @@ function requireApiKey(req, res, next) {
 }
 
 // ============================================================
-// PARSER / FORMATTER batch
-// ============================================================
-function parseCardLine(line) {
-    const raw = String(line || '').trim();
-    if (!raw || raw.startsWith('#')) return null;
-    const parts = raw.split('|').map(s => s.trim());
-    if (parts.length < 2) return null;
-
-    const pan = parts[0].replace(/\D/g, '');
-    if (!/^\d{13,19}$/.test(pan)) return null;
-
-    let expdate = null;
-    let originalCvv = null;
-
-    if (parts.length >= 4) {
-        const mm = parts[1].padStart(2, '0');
-        const yy = parts[2].length === 4 ? parts[2].slice(-2) : parts[2].padStart(2, '0');
-        expdate = yy + mm;
-        originalCvv = parts[3].replace(/\D/g, '') || null;
-    } else if (parts.length === 3) {
-        const p1 = parts[1], p2 = parts[2];
-        if (/^\d{4}$/.test(p1)) {
-            expdate = p1;
-            originalCvv = p2.replace(/\D/g, '') || null;
-        } else if (p1.length <= 2 && (p2.length === 2 || p2.length === 4)) {
-            const mm = p1.padStart(2, '0');
-            const yy = p2.length === 4 ? p2.slice(-2) : p2.padStart(2, '0');
-            expdate = yy + mm;
-        } else return null;
-    } else if (parts.length === 2) {
-        if (!/^\d{4}$/.test(parts[1])) return null;
-        expdate = parts[1];
-    } else return null;
-
-    return { pan, expdate, originalCvv, raw };
-}
-
-function formatCard(pan, expdateYYMM, cvv) {
-    const yy = expdateYYMM.slice(0, 2);
-    const mm = expdateYYMM.slice(2, 4);
-    return `${pan}|${mm}|20${yy}|${cvv}`;
-}
-
-// ============================================================
 // RUTAS
 // ============================================================
 app.get('/health',     (_q, r) => r.json({ status: 'OK', ts: Date.now() }));
 app.get('/api/health', (_q, r) => r.json({ status: 'healthy' }));
 
-app.get('/api/self-test', (_q, r) => {
-    try {
-        const base = {
-            pan: '4111111111111111',
-            expdate: '2805',
-            cvka: '0022446688AACCEE',
-            cvkb: 'FFDDBB9977553311'
-        };
-        r.json({
-            success: true,
-            cvv1_sc101: calculateCvv({ ...base, serviceCode: '101' }),
-            cvv2_sc000: calculateCvv({ ...base, serviceCode: '000' })
-        });
-    } catch (e) {
-        r.status(500).json({ success: false, error: e.message });
-    }
-});
-
-// Single
 app.post('/api/calculate-cvv', requireApiKey, (req, res) => {
     try {
         const b = req.body || {};
@@ -205,7 +121,7 @@ app.post('/api/calculate-cvv', requireApiKey, (req, res) => {
 
         if (!b.pan)          return res.status(400).json({ success: false, error: 'pan is required' });
         if (!b.expdate)      return res.status(400).json({ success: false, error: 'expdate (YYMM) is required' });
-        if (!cvka || !cvkb)  return res.status(400).json({ success: false, error: 'cvka/cvkb required (body or CVK_A/CVK_B env)' });
+        if (!cvka || !cvkb)  return res.status(400).json({ success: false, error: 'cvka/cvkb required (body or env)' });
 
         const cvv = calculateCvv({
             pan: b.pan,
@@ -219,84 +135,10 @@ app.post('/api/calculate-cvv', requireApiKey, (req, res) => {
     }
 });
 
-// Batch
-app.post('/api/calculate-cvv/batch', requireApiKey, (req, res) => {
-    try {
-        const b = req.body || {};
-        const cvka = b.cvka || DEFAULT_CVKA;
-        const cvkb = b.cvkb || DEFAULT_CVKB;
-        const serviceCode = b.service_code || b.serviceCode || '000';
-        const includeDetails = b.details !== false;
-
-        if (!cvka || !cvkb)
-            return res.status(400).json({ success: false, error: 'cvka/cvkb required (body or CVK_A/CVK_B env)' });
-
-        let lines = [];
-        if (Array.isArray(b.cards))           lines = b.cards.map(String);
-        else if (typeof b.text === 'string')  lines = b.text.split(/\r?\n/);
-        else if (typeof b.cards === 'string') lines = b.cards.split(/\r?\n/);
-        else return res.status(400).json({ success: false, error: 'Provide "text" or "cards"' });
-
-        const results = [], outputArr = [];
-        let ok = 0, fail = 0;
-
-        for (const raw of lines) {
-            const parsed = parseCardLine(raw);
-            if (!parsed) {
-                if (raw.trim() && !raw.trim().startsWith('#')) {
-                    results.push({ input: raw, success: false, error: 'Invalid format' });
-                    fail++;
-                }
-                continue;
-            }
-            try {
-                const cvv = calculateCvv({ ...parsed, serviceCode, cvka, cvkb });
-                const outLine = formatCard(parsed.pan, parsed.expdate, cvv);
-                results.push({
-                    success: true,
-                    input: parsed.raw,
-                    pan: parsed.pan,
-                    expdate: parsed.expdate,
-                    service_code: serviceCode,
-                    original_cvv: parsed.originalCvv,
-                    calculated_cvv: cvv,
-                    match: parsed.originalCvv ? parsed.originalCvv === cvv : null
-                });
-                outputArr.push(outLine);
-                ok++;
-            } catch (e) {
-                results.push({ input: parsed.raw, success: false, error: e.message });
-                fail++;
-            }
-        }
-
-        res.json({
-            success: true,
-            service_code: serviceCode,
-            total: results.length,
-            ok, fail,
-            output_text: outputArr.join('\n'),
-            output_lines: outputArr,
-            ...(includeDetails ? { results } : {})
-        });
-    } catch (err) {
-        res.status(400).json({ success: false, error: err.message });
-    }
-});
-
-// 404
 app.use((_q, r) => r.status(404).json({ error: 'Not found' }));
 
-// ============================================================
-// START
-// ============================================================
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`🔐 CVV Calculator API on port ${PORT}`);
-    console.log(`   Health:    GET  /health`);
-    console.log(`   Self-test: GET  /api/self-test`);
-    console.log(`   Single:    POST /api/calculate-cvv`);
-    console.log(`   Batch:     POST /api/calculate-cvv/batch`);
-    console.log(`   Auth:      ${API_KEY ? 'X-API-Key required' : 'DISABLED'}`);
-    console.log(`   CVK_A:     ${DEFAULT_CVKA ? 'loaded ✅' : 'MISSING ❌'}`);
-    console.log(`   CVK_B:     ${DEFAULT_CVKB ? 'loaded ✅' : 'MISSING ❌'}`);
+    console.log(`   CVK_A: ${DEFAULT_CVKA ? 'loaded ✅' : 'MISSING ❌'}`);
+    console.log(`   CVK_B: ${DEFAULT_CVKB ? 'loaded ✅' : 'MISSING ❌'}`);
 });
